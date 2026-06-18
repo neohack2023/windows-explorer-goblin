@@ -1,0 +1,24 @@
+{
+  "hotkey": "Ctrl+Space",
+  "max_suggestions": 8,
+  "history_file": "rename_history.jsonl",
+  "templates": {
+    "audio_sample": "{author}__{publisher}__{genre}__{instrument}__{bpm}bpm__{key}__{meter}__{sampletype}",
+    "texture_map": "{material}_{maptype}_{resolution}_{variant}",
+    "project_asset": "{project}_{component}_{version}_{status}"
+  },
+  "audio_keywords": [
+    "bassline",
+    "break",
+    "drum",
+    "glitch",
+    "lead",
+    "melody",
+    "loop",
+    "one-shot",
+    "sample",
+    "sfx",
+    "vocal"
+  ],
+  "separators": [" ", "_", "-", "."]
+}
