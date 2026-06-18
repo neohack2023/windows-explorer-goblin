@@ -1,0 +1,2 @@
+# MVP has no external dependencies.
+# Keep this file for future optional modules such as rapidfuzz, watchdog, or local model adapters.
