@@ -1,88 +1,52 @@
 #!/usr/bin/env python3
-"""Windows Explorer Goblin suggestion brain.
-
-Reads a small request JSON file and writes ranked suggestions as TSV lines:
-
-    suggestion<TAB>score<TAB>reason
-
-The AutoHotkey frontend keeps UI control. This module stays fast,
-dependency-free, and replaceable. Later we can bolt in Ollama or a
-small local model behind the same request/response contract.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-from dataclasses import dataclass
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Iterable, List, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "goblin_config.json"
 DEFAULT_HISTORY = ROOT / "rename_history.jsonl"
-
-SEPARATORS_RE = re.compile(r"[\s_\-.]+")
-BPM_RE = re.compile(r"(?P<bpm>\d{2,3})\s*bpm", re.IGNORECASE)
-KEY_RE = re.compile(r"(?P<key>[A-G](?:#|b)?)[_\-\s]?(?P<mode>major|minor|maj|min)", re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class Candidate:
-    text: str
-    source: str
-
-
-@dataclass(frozen=True)
-class Scored:
-    text: str
-    score: int
-    reason: str
+SPLIT_RE = re.compile(r"[\s_\-.]+")
+BAD_RE = re.compile(r'[\\/:*?"<>|]')
 
 
 def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
-def read_request(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def norm(s: str) -> str:
+    return str(s).strip().lower()
 
 
-def write_response(path: Path, rows: Sequence[Scored]) -> None:
-    lines: list[str] = []
-    for row in rows:
-        safe_text = row.text.replace("\t", " ").replace("\n", " ").strip()
-        safe_reason = row.reason.replace("\t", " ").replace("\n", " ").strip()
-        lines.append(f"{safe_text}\t{row.score}\t{safe_reason}")
-    path.write_text("\n".join(lines), encoding="utf-8")
+def clean(s: str) -> str:
+    s = str(s).strip().strip("'\"`.,;:[]{}()")
+    s = re.sub(r"\s+", " ", s)
+    s = BAD_RE.sub("-", s).rstrip(". ")
+    return s[:180]
 
 
-def normalize(text: str) -> str:
-    return text.strip().lower()
+def tokens(s: str) -> list[str]:
+    return [x for x in SPLIT_RE.split(norm(s)) if x]
 
 
-def tokenize(text: str) -> list[str]:
-    return [t for t in SEPARATORS_RE.split(normalize(text)) if t]
+def initials(s: str) -> str:
+    return "".join(x[0] for x in tokens(s) if x)
 
 
-def initials(text: str) -> str:
-    return "".join(t[:1] for t in tokenize(text))
-
-
-def subsequence_score(needle: str, haystack: str) -> int | None:
-    n = normalize(needle)
-    h = normalize(haystack)
+def subseq(a: str, b: str) -> int | None:
+    a, b = norm(a), norm(b)
     pos = 0
     score = 0
-    for ch in n:
-        found = h.find(ch, pos)
+    for ch in a:
+        found = b.find(ch, pos)
         if found < 0:
             return None
         score += found - pos
@@ -90,254 +54,194 @@ def subsequence_score(needle: str, haystack: str) -> int | None:
     return score
 
 
-def word_start_score(typed: str, candidate: str) -> int | None:
-    t = normalize(typed)
-    parts = tokenize(candidate)
-    for index, part in enumerate(parts):
-        if part.startswith(t):
-            return 40 + index * 7 + abs(len(candidate) - len(typed))
-    return None
-
-
-def contains_score(typed: str, candidate: str) -> int | None:
-    t = normalize(typed)
-    c = normalize(candidate)
-    pos = c.find(t)
-    if pos >= 0:
-        return 100 + pos + abs(len(candidate) - len(typed))
-    return None
-
-
-def structural_bonus(typed: str, candidate: str) -> int:
-    """Bonus for common dataset/audio naming signals."""
-    t = normalize(typed)
-    c = normalize(candidate)
-    bonus = 0
-
-    if BPM_RE.search(c) and any(ch.isdigit() for ch in t):
-        bonus -= 12
-
-    if KEY_RE.search(c):
-        key = KEY_RE.search(c)
-        if key and normalize(key.group("key")) in t:
-            bonus -= 12
-
-    audio_terms = [
-        "bass",
-        "bassline",
-        "break",
-        "drum",
-        "glitch",
-        "lead",
-        "loop",
-        "melody",
-        "sfx",
-        "vocal",
-    ]
-    if any(term in c for term in audio_terms) and any(term[:2] in t for term in audio_terms):
-        bonus -= 8
-
-    return bonus
-
-
-def score_candidate(typed: str, candidate: Candidate) -> Scored | None:
-    t = normalize(typed)
-    c = normalize(candidate.text)
-
-    if not t or not c:
-        return None
-
-    if c == t:
-        return Scored(candidate.text, 0, f"exact match from {candidate.source}")
-
-    if c.startswith(t):
-        score = 10 + abs(len(candidate.text) - len(typed))
-        if candidate.source == "history":
-            score -= 4
-        score += structural_bonus(typed, candidate.text)
-        return Scored(candidate.text, max(score, 1), f"prefix match from {candidate.source}")
-
-    ws = word_start_score(typed, candidate.text)
-    if ws is not None:
-        score = ws + structural_bonus(typed, candidate.text)
-        return Scored(candidate.text, max(score, 1), f"word-start match from {candidate.source}")
-
-    cs = contains_score(typed, candidate.text)
-    if cs is not None:
-        score = cs + structural_bonus(typed, candidate.text)
-        return Scored(candidate.text, max(score, 1), f"contains match from {candidate.source}")
-
-    init = initials(candidate.text)
-    if init.startswith(t):
-        score = 160 + abs(len(candidate.text) - len(typed)) + structural_bonus(typed, candidate.text)
-        return Scored(candidate.text, max(score, 1), f"initials match from {candidate.source}")
-
-    sub = subsequence_score(typed, candidate.text)
-    if sub is not None:
-        score = 240 + sub + abs(len(candidate.text) - len(typed)) + structural_bonus(typed, candidate.text)
-        return Scored(candidate.text, max(score, 1), f"fuzzy sequence from {candidate.source}")
-
-    return None
-
-
-def unique_candidates(candidates: Iterable[Candidate]) -> list[Candidate]:
-    seen: set[str] = set()
-    out: list[Candidate] = []
-    for cand in candidates:
-        text = cand.text.strip()
-        if not text:
-            continue
-        key = normalize(text)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(Candidate(text=text, source=cand.source))
-    return out
-
-
-def local_candidates(folder: Path, is_folder: bool, extension: str, current_name: str) -> list[Candidate]:
-    out: list[Candidate] = []
-    if not folder.exists() or not folder.is_dir():
-        return out
-
-    current_base = normalize(Path(current_name).stem if current_name else current_name)
-    ext = normalize(extension).lstrip(".")
-
-    try:
-        children = list(folder.iterdir())
-    except OSError:
-        return out
-
-    if is_folder:
-        for child in children:
-            if child.is_dir() and normalize(child.name) != current_base:
-                out.append(Candidate(child.name, "sibling-folder"))
-        return out
-
-    same_ext: list[Candidate] = []
-    other_ext: list[Candidate] = []
-    for child in children:
-        if not child.is_file():
-            continue
-        if normalize(child.stem) == current_base:
-            continue
-        if normalize(child.suffix).lstrip(".") == ext:
-            same_ext.append(Candidate(child.stem, "same-extension"))
-        else:
-            other_ext.append(Candidate(child.stem, "nearby-file"))
-
-    out.extend(same_ext)
-    out.extend(other_ext)
-    return out
-
-
-def load_history(history_path: Path) -> list[Candidate]:
-    if not history_path.exists():
+def read_history(path: Path) -> list[tuple[str, str]]:
+    if not path.exists():
         return []
-
-    out: list[Candidate] = []
-    try:
-        for line in history_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-                name = str(item.get("name", "")).strip()
-            except Exception:
-                name = line
-            if name:
-                out.append(Candidate(name, "history"))
-    except OSError:
-        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            name = json.loads(line).get("name", "")
+        except Exception:
+            name = line
+        name = clean(name)
+        if name:
+            out.append((name, "history"))
     return out
 
 
-def save_history(name: str, history_path: Path) -> None:
-    name = name.strip()
+def save_history(name: str, path: Path) -> None:
+    name = clean(name)
     if not name:
         return
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {normalize(c.text) for c in load_history(history_path)}
-    if normalize(name) in existing:
-        return
-    with history_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"name": name}, ensure_ascii=False) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = {norm(x[0]) for x in read_history(path)}
+    if norm(name) not in existing:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"name": name}, ensure_ascii=False) + "\n")
 
 
-def template_candidates(typed: str, config: dict) -> list[Candidate]:
-    """Lightweight project-aware hints. These are intentionally conservative."""
-    t = normalize(typed)
-    out: list[Candidate] = []
-
-    if not t:
+def sibling_candidates(folder: Path, is_folder: bool, ext: str, current: str) -> list[tuple[str, str]]:
+    try:
+        kids = list(folder.iterdir())
+    except Exception:
+        return []
+    out = []
+    cur = norm(Path(current).stem if current else current)
+    ext = norm(ext).lstrip(".")
+    if is_folder:
+        for k in kids:
+            if k.is_dir() and norm(k.name) != cur:
+                out.append((k.name, "folder nearby"))
         return out
-
-    audio_terms = set(config.get("audio_keywords", []))
-    if any(term in t for term in audio_terms) or any(part in t for part in ["bpm", "minor", "major", "loop"]):
-        out.extend(
-            [
-                Candidate("author__publisher__genre__instrument__bpm__key__meter__sampletype", "template"),
-                Candidate("samplefocus__glitch__lead-melody__145bpm__A-minor__4-4__loop", "template"),
-            ]
-        )
-
-    if any(part in t for part in ["alb", "norm", "rough", "metal", "texture", "map"]):
-        out.extend(
-            [
-                Candidate("material_albedo_1024_v01", "template"),
-                Candidate("material_normal_1024_v01", "template"),
-                Candidate("material_roughness_1024_v01", "template"),
-            ]
-        )
-
+    for k in kids:
+        if k.is_file() and norm(k.stem) != cur:
+            src = "same extension" if norm(k.suffix).lstrip(".") == ext else "nearby file"
+            out.append((k.stem, src))
     return out
 
 
-def rank_suggestions(request: dict, config: dict) -> list[Scored]:
-    typed = str(request.get("typed", ""))
-    folder = Path(str(request.get("folder", "")))
-    is_folder = bool(request.get("is_folder", False))
-    extension = str(request.get("extension", ""))
-    current_name = str(request.get("current_name", ""))
-    max_suggestions = int(request.get("max_suggestions", config.get("max_suggestions", 8)))
+def fallback_candidates(typed: str, folder: Path, is_folder: bool, cfg: dict) -> list[tuple[str, str]]:
+    base = list(cfg.get("fallback_dictionary", []))
+    if is_folder:
+        base += ["examples", "experiments", "exports", "explorer-goblin-experiments", "explorer-overlay-tests", "extension-tests"]
+    for part in folder.parts[-5:]:
+        p = norm(part)
+        if p and p not in {"users", "documents", "desktop", "downloads"}:
+            base += [p, f"{p}-examples", f"{p}-experiments", f"{p}-exports"]
+    expansions = {
+        "ex": ["examples", "experiments", "exports", "explorer-goblin-experiments", "extension-tests"],
+        "exp": ["experiments", "exports", "explorer-goblin-experiments"],
+        "sam": ["samples", "sample-packs", "samplefocus-catalog"],
+        "dat": ["dataset", "datasets", "training-data"],
+        "tex": ["textures", "texture-maps", "texture-map-tests"],
+        "aud": ["audio-samples", "audio-dataset", "audio-training-data"],
+        "doc": ["docs", "documentation", "notes"],
+        "src": ["src", "source", "source-experiments"],
+    }
+    base += expansions.get(norm(typed), [])
+    out = []
+    for x in base:
+        x = clean(x)
+        if x:
+            out.append((x, "fallback brain"))
+    return out
 
-    history_path = Path(str(request.get("history_file", DEFAULT_HISTORY)))
-    if not history_path.is_absolute():
-        history_path = ROOT / history_path
 
-    if request.get("learn"):
-        save_history(str(request.get("learn", "")), history_path)
-        return []
-
-    candidates = unique_candidates(
-        [
-            *local_candidates(folder, is_folder, extension, current_name),
-            *load_history(history_path),
-            *template_candidates(typed, config),
+def template_candidates(typed: str) -> list[tuple[str, str]]:
+    t = norm(typed)
+    out = []
+    if any(x in t for x in ["sam", "aud", "bpm", "loop", "bass", "glitch"]):
+        out += [
+            ("author__publisher__genre__instrument__bpm__key__meter__sampletype", "audio template"),
+            ("samplefocus__glitch__lead-melody__145bpm__A-minor__4-4__loop", "audio template"),
         ]
-    )
+    if any(x in t for x in ["tex", "map", "norm", "rough", "metal"]):
+        out += [("material_albedo_1024_v01", "texture template"), ("material_normal_1024_v01", "texture template"), ("material_roughness_1024_v01", "texture template")]
+    return out
 
-    scored: list[Scored] = []
-    for cand in candidates:
-        row = score_candidate(typed, cand)
-        if row is not None:
-            scored.append(row)
 
-    scored.sort(key=lambda r: (r.score, len(r.text), r.text.lower()))
-    return scored[:max_suggestions]
+def local_model_candidates(req: dict, cfg: dict, nearby: list[str]) -> list[tuple[str, str]]:
+    slm = cfg.get("slm", {})
+    if not slm.get("enabled", False) or shutil.which("ollama") is None:
+        return []
+    typed = str(req.get("typed", "")).strip()
+    if len(typed) < int(slm.get("minimum_typed_length", 2)):
+        return []
+    model = str(slm.get("model", "qwen2.5:0.5b"))
+    timeout = float(slm.get("timeout_seconds", 2.5))
+    mode = "folder" if req.get("is_folder") else "file name"
+    prompt = "Suggest 8 short Windows " + mode + " options. One name per line. Typed text: " + typed + ". Nearby names: " + ", ".join(nearby[:20])
+    try:
+        r = subprocess.run(["ollama", "run", model, prompt], text=True, capture_output=True, timeout=timeout, encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        line = re.sub(r"^\s*[-*\d.)]+\s*", "", line)
+        name = clean(line)
+        if name:
+            out.append((name, "local model"))
+    return out[:8]
+
+
+def unique(items: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen = set()
+    out = []
+    for name, src in items:
+        name = clean(name)
+        k = norm(name)
+        if name and k not in seen:
+            seen.add(k)
+            out.append((name, src))
+    return out
+
+
+def score(typed: str, name: str, src: str) -> tuple[int, str] | None:
+    t, n = norm(typed), norm(name)
+    if not t or not n:
+        return None
+    bias = {"history": -10, "folder nearby": -8, "same extension": -8, "fallback brain": 4, "audio template": 12, "texture template": 12, "local model": 16}.get(src, 0)
+    if n == t:
+        return (0, "exact " + src)
+    if n.startswith(t):
+        return (max(1, 10 + len(n) - len(t) + bias), "prefix " + src)
+    for i, part in enumerate(tokens(name)):
+        if part.startswith(t):
+            return (max(1, 40 + i * 7 + len(n) - len(t) + bias), "word-start " + src)
+    pos = n.find(t)
+    if pos >= 0:
+        return (max(1, 100 + pos + len(n) - len(t) + bias), "contains " + src)
+    if initials(name).startswith(t):
+        return (max(1, 160 + len(n) - len(t) + bias), "initials " + src)
+    sq = subseq(t, n)
+    if sq is not None:
+        return (max(1, 240 + sq + len(n) - len(t) + bias), "fuzzy " + src)
+    return None
+
+
+def rank(req: dict, cfg: dict) -> list[tuple[str, int, str]]:
+    typed = str(req.get("typed", ""))
+    folder = Path(str(req.get("folder", "")))
+    hist = Path(str(req.get("history_file", DEFAULT_HISTORY)))
+    if not hist.is_absolute():
+        hist = ROOT / hist
+    if req.get("learn"):
+        save_history(str(req.get("learn", "")), hist)
+        return []
+    maxn = int(req.get("max_suggestions", cfg.get("max_suggestions", 8)))
+    items = unique(sibling_candidates(folder, bool(req.get("is_folder")), str(req.get("extension", "")), str(req.get("current_name", ""))) + read_history(hist) + fallback_candidates(typed, folder, bool(req.get("is_folder")), cfg) + template_candidates(typed))
+    scored = []
+    for name, src in items:
+        s = score(typed, name, src)
+        if s:
+            scored.append((name, s[0], s[1]))
+    scored.sort(key=lambda x: (x[1], len(x[0]), x[0].lower()))
+    call_under = int(cfg.get("slm", {}).get("call_when_under_suggestions", 5))
+    if len(scored) < call_under:
+        more = unique(items + local_model_candidates(req, cfg, [x[0] for x in items]))
+        scored = []
+        for name, src in more:
+            s = score(typed, name, src)
+            if s:
+                scored.append((name, s[0], s[1]))
+        scored.sort(key=lambda x: (x[1], len(x[0]), x[0].lower()))
+    return scored[:maxn]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Windows Explorer Goblin suggestion brain")
-    parser.add_argument("--request", required=True, help="Path to request JSON")
-    parser.add_argument("--out", required=True, help="Path to output TSV")
-    args = parser.parse_args()
-
-    config = load_config()
-    request = read_request(Path(args.request))
-    rows = rank_suggestions(request, config)
-    write_response(Path(args.out), rows)
+    p = argparse.ArgumentParser()
+    p.add_argument("--request", required=True)
+    p.add_argument("--out", required=True)
+    a = p.parse_args()
+    req = json.loads(Path(a.request).read_text(encoding="utf-8"))
+    rows = rank(req, load_config())
+    text = "\n".join(f"{n}\t{s}\t{r}" for n, s, r in rows)
+    Path(a.out).write_text(text, encoding="utf-8")
     return 0
 
 
